@@ -1,0 +1,71 @@
+# dsh-mac-browser 组合包补丁：把浏览器控制工具行插入 profile。
+#
+# 本补丁在安装后自动生效（package.json 的 dsh.bundle.patch 指向它）。
+# 想改配置，不要改这里 —— 在你自己 profile 的 cordis.patch.yml 里按 id 覆盖
+# 同名的 mac-browser 行，你的层在 bundle 层之后应用，会赢：
+#
+#   - id: mac-browser
+#     config:
+#       pointer: { steps: 60, stepMs: 25 }
+#
+# 这一行只注册模型工具、不发布任何服务，所以直接坐在这里；
+# 给它包 isolate realm 反而会让它解析不到宿主的 subprocess 与 tools。
+#
+# 不要加 `disabled: process.platform !== 'darwin'` —— 它现在跨平台：
+# macOS 走 AppleScript（能力完整），Windows 走 PowerShell（只做 OS 层）。
+# 不存在的后端 id 会被静默跳过，defaultBackend 不属于本平台时自动退回第一个可用后端。
+- insert:
+    - id: mac-browser
+      name: 'dsh-mac-browser'
+      config:
+        backends: [safari, chrome, edge]
+        defaultBackend: safari
+        timeoutMs: 20000
+
+        # 鼠标移动手感。默认 48 步 × 20ms ≈ 0.96s 且带缓动 —— 匀速直线看起来像
+        # 「被拖过去」，ease-in-out（起步慢、中间快、收尾停住）才像人。
+        # 嫌慢就调小，嫌快就调大；两者都会被夹到合理区间（步数 2–400，间隔 1–200ms）。
+        pointer:
+          steps: 48
+          stepMs: 20
+          easing: easeInOut        # easeInOut | linear
+
+        # 往系统提示词里注入「多指令 / 模糊指令」处理约定 —— 装到哪个 agent
+        # 都生效。想关掉设 false；想换文案用 instructionProtocolText；
+        # 位置用 instructionProtocolOrder（默认 15：persona 之上、工具类之下）。
+        instructionProtocol: true
+
+        # ── 站点配方 ────────────────────────────────────────────────────────
+        # 把「某个网站上的固定操作」固化成声明式步骤，避免每次现编选择器，
+        # 页面小改时也只改这里。用 mac_browser_recipe 工具执行；
+        # 省略 name 调用它就列出全部可用配方。
+        #
+        # 步骤词汇表（每项只写一个键）：
+        #   goto: <url>                        打开网址（配 real: true 走地址栏）
+        #   wait: <毫秒>                       固定等待
+        #   waitFor: <selector>                轮询到元素出现（可配 timeoutMs）
+        #   click: <selector> | { selector|text, index, real }
+        #   type: { selector|text, value, submit, real }
+        #   eval: <js 表达式>                  逃生口，结果可用 {{__last}} 串到下一步
+        #   screenshot: true | { selector }    截图，路径写进 trace
+        #
+        # 字符串里的 {{name}} 会被调用时的 vars 替换；内置 {{url}} 是当前地址。
+        # 声明了 match 的配方，只有在当前标签页 URL 含该子串时才允许执行。
+        #
+        # 下面这条是可直接用的示例（去掉 # 即可）：在示例站点搜索一个词并打开第一个结果。
+#
+# recipes:
+#   - name: example-search
+#     match: example.com
+#     description: 在示例站点搜索关键词
+#     steps:
+#       - click: input.search-input
+#       - type: { selector: input.search-input, value: '{{query}}', submit: true }
+#       - waitFor: .result-list a
+#
+#   - name: example-first-item
+#     match: example.com
+#     description: 打开结果列表里的第一个（真实鼠标键盘，看得见）
+#     steps:
+#       - waitFor: .result-list a
+#       - click: { selector: .result-list a, index: 0, real: true }
