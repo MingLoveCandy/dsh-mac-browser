@@ -1,6 +1,6 @@
 {
   "name": "dsh-mac-browser",
-  "version": "0.2.0",
+  "version": "0.7.1",
   "private": true,
   "description": "让 agent 直接操作真实的浏览器：macOS 走 AppleScript（Safari/Chrome，能力完整），Windows 走 PowerShell（Chrome/Edge，只做 OS 层）。后端可插拔。",
   "type": "module",
@@ -9,19 +9,34 @@
     ".": {
       "default": "./index.js"
     },
+    "./client": {
+      "default": "./client.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "selftest.mjs",
     "checks",
     "cordis.patch.yml",
     "README.md"
   ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "keywords": [

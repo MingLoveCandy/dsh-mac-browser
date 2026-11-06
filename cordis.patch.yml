@@ -22,10 +22,28 @@
         defaultBackend: safari
         timeoutMs: 20000
 
+        # 工具级时限（毫秒）：一次工具调用的整体上限，由 DSH 内置的
+        # dsh-tool-call-timeout-policy 读 ToolDefinition.timeoutMs 后强制执行。
+        # 上面那个 timeoutMs 管单次子进程往返，这个管整条流程，别搞混。
+        # 没列出的工具用内置值（recipe 180s、click/type/scroll/open 45s、其余 20–30s）。
+        # 某个站点/配方就是慢，在这里按工具名放宽：
+        # toolTimeouts:
+        #   mac_browser_recipe: 300000
+
         # 鼠标移动手感。默认 48 步 × 20ms ≈ 0.96s 且带缓动 —— 匀速直线看起来像
         # 「被拖过去」，ease-in-out（起步慢、中间快、收尾停住）才像人。
         # 嫌慢就调小，嫌快就调大；两者都会被夹到合理区间（步数 2–400，间隔 1–200ms）。
         pointer:
+          # 输入总开关：
+          #   synthetic（缺省）—— 页内合成点击。快、不依赖前台、不要辅助功能，
+          #                       但**看不见光标**（页面照样会响应点击）。
+          #   real            —— 真实鼠标键盘，光标会真的从当前位置走过去。
+          #                       代价：每步约 1.5s，且目标标签页必须在前台。
+          # 单次调用仍可覆盖：real: true / real: false，参数优先于这个开关。
+          # 也可以不开文件：0.4.0 起插件带了一个配置页，侧栏
+          # 「插件 → 已安装 → dsh-mac-browser → 配置」里点一下就切。
+          # 改完要重载插件才生效。
+          mode: synthetic           # synthetic | real
           steps: 48
           stepMs: 20
           easing: easeInOut        # easeInOut | linear
@@ -46,6 +64,9 @@
         #   waitFor: <selector>                轮询到元素出现（可配 timeoutMs）
         #   click: <selector> | { selector|text, index, real }
         #   type: { selector|text, value, submit, real }
+        #   scrollUntil: { text, container?, step?, max? }
+        #       在容器里「滚一段 → 找一次」，直到目标文字出现。虚拟列表
+        #       （番剧选集、长列表）只能这么处理 —— 没渲染的元素不在 DOM 里。
         #   eval: <js 表达式>                  逃生口，结果可用 {{__last}} 串到下一步
         #   screenshot: true | { selector }    截图，路径写进 trace
         #

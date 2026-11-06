@@ -34,9 +34,52 @@
 import { access, readFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 
 /** Cordis 插件名（loader 诊断用）。 */
 export const name = 'mac-browser'
+
+/**
+ * 配置 schema。
+ *
+ * 为什么要声明它：DSH 的 `settings` 服务只给**有原生 Config 的插件**投影命名空间
+ * （`isNativeConfigSchema` 认的是 schemastery，不是 zod）。没有它，界面上连
+ * 「配置」入口都不会出现 —— 客户端页面拿不到 `form`，写不进去。
+ *
+ * 几个刻意的选择：
+ *   · 所有键都写进来。schemastery 的 object 会**保留未知键**，但漏写已知键会让它
+ *     从投影里消失，配方和 toolTimeouts 就白配了。
+ *   · `pointer.mode` 用宽松的 string 而不是 union(const…)：写错时应当像以前一样
+ *     静默退回 synthetic，而不是让整行插件激活失败 —— 这里挡下来，代价是整个浏览器
+ *     能力全没，不值得。
+ *   · 数值一律用宽松的 number()，真正的夹紧仍在代码里做 —— 写个 -1 应当被夹回
+ *     合理区间，而不是让整行插件校验失败、把浏览器能力一起带走。
+ */
+export const Config = z.object({
+  backends: z.array(z.string()).description('启用哪些后端；空数组 = 全部'),
+  defaultBackend: z.string().description('省略 browser 参数时的落点'),
+  timeoutMs: z.number().description('单次 osascript / PowerShell 往返超时（毫秒）'),
+  maxOutputBytes: z.number().description('单流输出上限（字节）'),
+  cwd: z.string().description('子进程工作目录'),
+  hostApp: z.string().description('mac_browser_host_focus 的目标 app；缺省按宿主进程推断'),
+  pointer: z
+    .object({
+      mode: z
+        .string()
+        .default('synthetic')
+        .description('synthetic = 页内合成点击（快、看不见光标）；real = 真实鼠标键盘（光标会真的走过去）'),
+      steps: z.number().default(48).description('鼠标移动插值步数（2–400）'),
+      stepMs: z.number().default(20).description('每步间隔毫秒（1–200）'),
+      easing: z.string().default('easeInOut').description('easeInOut 或 linear'),
+    })
+    .default({})
+    .description('鼠标移动与输入模式'),
+  toolTimeouts: z.dict(z.number()).default({}).description('按工具名覆盖整体时限（毫秒）'),
+  recipes: z.array(z.any()).default([]).description('站点配方'),
+  instructionProtocol: z.boolean().default(true).description('是否注入「多指令 / 模糊指令」处理约定'),
+  instructionProtocolText: z.string().description('整段替换掉那段约定文案'),
+  instructionProtocolOrder: z.number().default(15).description('该提示词段的位置'),
+})
 
 /** tools 注册表与 subprocess seam 必须先存在。 */
 export const inject = ['subprocess', 'tools']
@@ -46,6 +89,60 @@ const RECORD_SEP = '\u001e'
 const DEFAULT_TIMEOUT_MS = 20000
 const DEFAULT_MAX_OUTPUT_BYTES = 512000
 const GRACE_MS = 2000
+
+/**
+ * 每个工具的**整体**时限（毫秒）。
+ *
+ * 这是 `ToolDefinition.timeoutMs`，由 DSH 内置的 `dsh-tool-call-timeout-policy`
+ * 读出来强制执行：到点它就 abort `exec.signal`，我们内部照常把取消转成终止子进程，
+ * 模型收到的是一条干净的 `TOOL_TIMEOUT` 错误，而不是一轮永远不结束的等待。
+ *
+ * 和 `config.timeoutMs` 是两层，别搞混：
+ *   · config.timeoutMs —— **一次 osascript / PowerShell 往返**的上限（默认 20s）
+ *   · 这里的值         —— **一次工具调用**的上限，可能包含好几次子进程 + 页内轮询
+ *                          + 真实鼠标动画（48 步 × 20ms ≈ 1s）
+ *
+ * 为什么不统一成一个值：这些工具耗时差着量级。读一次正文几百毫秒，真实鼠标点一下
+ * 1.5 秒，一条配方能连着走十几步。统一值要么误杀配方，要么对单步操作形同虚设。
+ *
+ * 想按站点调（比如某条配方就是慢），用 config.toolTimeouts 覆盖。
+ */
+const TOOL_TIMEOUT_MS = {
+  mac_browser_status: 30_000,
+  mac_browser_open: 45_000,
+  mac_browser_tabs: 20_000,
+  mac_browser_read: 20_000,
+  mac_browser_eval: 20_000,
+  mac_browser_activate: 20_000,
+  mac_browser_close: 20_000,
+  mac_browser_click: 45_000,
+  mac_browser_type: 45_000,
+  mac_browser_screenshot: 30_000,
+  mac_browser_snapshot: 30_000,
+  mac_browser_scroll: 45_000,
+  mac_browser_formcheck: 30_000,
+  mac_browser_host_focus: 30_000,
+  mac_browser_recipe: 180_000,
+}
+
+/**
+ * 可以和别的工具**同时**跑的工具（`ToolDefinition.isConcurrencySafe` 返回 true）。
+ *
+ * 不声明这个字段时，DSH 按 **exclusive** 处理：这一次 batch 里它独占，同批的其他
+ * 调用排队。浏览器是一份共享的可变状态，所以点名、打字、滚动、开关标签页都不能并行 ——
+ * 两个真实鼠标事件同时发出，落点会互相踩，而且会「都报成功」。
+ *
+ * 名单里只放**纯读且不改页面**的：自检、列标签页、读正文、截图、表单体检。
+ * `snapshot` 故意不在里面：它会给元素打 `data-mb-ref` 编号，两次并发会互相重编号，
+ * 于是前一次拿到的 ref 直接失效。
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  'mac_browser_status',
+  'mac_browser_tabs',
+  'mac_browser_read',
+  'mac_browser_screenshot',
+  'mac_browser_formcheck',
+])
 
 /**
  * 随插件一起走的「多指令 / 模糊指令」处理约定。
@@ -126,7 +223,20 @@ function __mbVisible(el) {
 }
 function __mbLabel(el) {
   var t = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder'));
-  if (!t) t = (el.value !== undefined && el.value !== '') ? el.value : (el.innerText || el.textContent || '');
+  if (!t) {
+    // 注意：只有表单控件才认 value。
+    //
+    // 原来的判断是 el.value !== undefined && el.value !== '' —— 可 li 天生带一个
+    // 数字型 value（有序列表的序号，默认 0）。于是每个菜单项的标签都变成 "0"：
+    // 快照里整列是 0、点击回显是「0」、连「命中多个」的候选清单也全是 0，等于没标签。
+    // 更糟的是按 text 定位时 li 永远匹配不上，只能落到包住整页的祖先 div 上
+    // （实测点到过 div#app，页面毫无反应却报「已点击」）。
+    // li / option / progress 都有 value，所以按标签判，别按「有没有值」判。
+    var isFormField = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
+      el.tagName === 'SELECT' || el.tagName === 'BUTTON';
+    var v = isFormField ? el.value : undefined;
+    t = (typeof v === 'string' && v !== '') ? v : (el.innerText || el.textContent || '');
+  }
   return String(t).replace(/\s+/g, ' ').trim();
 }
 function __mbArea(el) {
@@ -430,9 +540,70 @@ function __mbFormCheck() {
 
   return { ok: true, count: found.length, items: found, url: location.href };
 }
+/**
+ * 往一个滚动容器里滚一段，并回报「目标文字出现了没」。
+ *
+ * 为什么需要它：番剧选集、商品列表这类**虚拟列表**一次只渲染 ~20 项，
+ * 没渲染出来的元素在 DOM 里根本不存在 —— filter/snapshot 都看不见，
+ * 于是只能绕去搜索。真正该做的是「滚一段、找一次、再滚」，循环到出现为止。
+ *
+ * 这一步只滚一次，循环放在宿主侧：页内没法 await 下一帧，回吐一次反而干净。
+ */
+function __mbScrollFind(o) {
+  var sel = String(o.container || '');
+  var needle = String(o.text || '');
+  var step = Math.max(50, Math.min(3000, Number(o.step) || 400));
+  var box = sel === '' ? null : document.querySelector(sel);
+
+  // 先查一次再滚：目标可能本来就在视野里。不先查的话，第一轮就会白滚 400px，
+  // 对着已经到位的列表反复跑会一路越滚越过。
+  function find() {
+    var pool = Array.prototype.slice.call(document.querySelectorAll(__MB_POOL));
+    for (var i = 0; i < pool.length; i++) {
+      var el = pool[i];
+      var L = __mbLabel(el);
+      if (!L || L.indexOf(needle) === -1) continue;
+      if (!__mbVisible(el)) continue;
+      return el;
+    }
+    return null;
+  }
+
+  var hit = find();
+  if (hit !== null) {
+    var nowAt = box ? box.scrollTop : window.scrollY;
+    return { ok: true, found: true, atEnd: false, scrollTop: Math.round(nowAt), max: 0 };
+  }
+
+  var max = 0;
+  if (box) {
+    box.scrollTop = Math.min(box.scrollHeight, box.scrollTop + step);
+    max = Math.max(0, box.scrollHeight - box.clientHeight);
+  } else {
+    window.scrollBy(0, step);
+    max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+  }
+
+  hit = find();
+  var after = box ? box.scrollTop : window.scrollY;
+  return {
+    ok: true,
+    found: hit !== null,
+    atEnd: after >= max - 1,
+    scrollTop: Math.round(after),
+    max: Math.round(max),
+  };
+}
+
 function __mbSnapshot(o) {
   var max = o.max && o.max > 0 ? Math.min(200, o.max) : 60;
-  var textMax = o.textMax && o.textMax > 0 ? Math.min(8000, o.textMax) : 1200;
+  // 可见文字块默认只留 400 字（原来是 1200）。它和元素标签高度重叠，却常年占掉
+  // 快照一半的体积。要看全页文字就显式传 textMax（最大 8000），传 0 是彻底不要。
+  var textMax = (o.textMax === undefined || o.textMax === null)
+    ? 400
+    : Math.min(8000, Math.max(0, Number(o.textMax) || 0));
+  var onlyInteractive = o.only === 'interactive';
+  var filter = String(o.filter === undefined || o.filter === null ? '' : o.filter).trim().toLowerCase();
 
   // 先清掉上一次的编号：否则页面变化后旧 ref 会指向错的东西
   var stale = document.querySelectorAll('[data-mb-ref]');
@@ -442,7 +613,8 @@ function __mbSnapshot(o) {
   // role / onclick / tabindex 的 div，靠框架的 @click 绑事件 —— 只按语义标签找
   // 会完全看不见它，快照里直接少了整个导航。
   // 所以补一个通用信号：**计算样式里 cursor 是 pointer**。这正是「这东西能点」
-  // 的视觉约定，手写的 Vue/React 组件几乎都靠它。
+  // 的视觉约定，手写的 Vue/React 组件几乎都靠它。only:'interactive' 是显式放弃
+  // 这一层兜底、只认语义标签，用来换更小的输出 —— 默认不开，因为漏导航的代价更大。
   var pool = Array.prototype.slice.call(document.querySelectorAll(__MB_POOL));
   var keep = [];
   for (var i = 0; i < pool.length; i++) {
@@ -451,6 +623,7 @@ function __mbSnapshot(o) {
     var r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) continue;   // 布局残留，不是给人点的
     if (!el.matches(__MB_INTERACTIVE)) {
+      if (onlyInteractive) continue;
       // 只有非语义元素才去问计算样式 —— 那一步比 matches() 贵得多
       var cur = '';
       try { cur = window.getComputedStyle(el).cursor; } catch (cursorErr) { cur = '' }
@@ -474,12 +647,14 @@ function __mbSnapshot(o) {
   });
 
   var total = keep.length;
-  var list = keep.slice(0, max);
-  var items = [];
-  for (var j = 0; j < list.length; j++) {
-    var e = list[j];
+
+  // filter 要拿 label 比对，所以先算 label、再决定编号：**过滤后重新从 1 编**。
+  // 先编号再过滤的话，「第 2 个」还是过滤前的第 2 个，点下去就错位了。
+  var scan = filter === '' ? keep.slice(0, max) : keep;
+  var prepared = [];
+  for (var j = 0; j < scan.length; j++) {
+    var e = scan[j];
     var rect = e.getBoundingClientRect();
-    e.setAttribute('data-mb-ref', String(j + 1));
     var kind = e.tagName.toLowerCase();
     if (kind === 'input') kind = 'input[' + (e.type || 'text') + ']';
 
@@ -512,13 +687,31 @@ function __mbSnapshot(o) {
       label = (rowCtx ? rowCtx + ' › ' : '') + '<图标 ' + String(myIndex) + '/' + String(sameCount) + '>';
     }
 
-    items.push({
-      ref: j + 1,
+    prepared.push({
+      el: e,
       kind: kind,
       label: label,
       w: Math.round(rect.width),
-      h: Math.round(rect.height),
-      disabled: e.disabled === true || e.getAttribute('aria-disabled') === 'true'
+      h: Math.round(rect.height)
+    });
+  }
+
+  var matched = filter === '' ? prepared : prepared.filter(function (item) {
+    return item.label.toLowerCase().indexOf(filter) >= 0;
+  });
+
+  var list = matched.slice(0, max);
+  var items = [];
+  for (var m = 0; m < list.length; m++) {
+    var it = list[m];
+    it.el.setAttribute('data-mb-ref', String(m + 1));
+    items.push({
+      ref: m + 1,
+      kind: it.kind,
+      label: it.label,
+      w: it.w,
+      h: it.h,
+      disabled: it.el.disabled === true || it.el.getAttribute('aria-disabled') === 'true'
     });
   }
 
@@ -530,39 +723,47 @@ function __mbSnapshot(o) {
   //
   // 做法：遍历所有元素，只收**直接文本节点**（不取 textContent，避免父子重复
   // 计入），再按矩形与视口求交过滤。
-  var vw = window.innerWidth, vh = window.innerHeight;
-  var pieces = [];
-  var chars = 0;
-  var nodes = document.body ? document.body.querySelectorAll('*') : [];
-  for (var n = 0; n < nodes.length; n++) {
-    var node = nodes[n];
-    var own = '';
-    for (var c = 0; c < node.childNodes.length; c++) {
-      if (node.childNodes[c].nodeType === 3) own += node.childNodes[c].nodeValue;
+  //
+  // 定向快照（给了 filter）**不返回文字块**：目标已经在元素表里了，再附一整段
+  // 页面文字纯属浪费。
+  var viewportText = '';
+  if (textMax > 0 && filter === '') {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var pieces = [];
+    var chars = 0;
+    var nodes = document.body ? document.body.querySelectorAll('*') : [];
+    for (var n2 = 0; n2 < nodes.length; n2++) {
+      var node = nodes[n2];
+      var own = '';
+      for (var c = 0; c < node.childNodes.length; c++) {
+        if (node.childNodes[c].nodeType === 3) own += node.childNodes[c].nodeValue;
+      }
+      own = own.replace(/\s+/g, ' ').trim();
+      if (!own) continue;
+      var nr = node.getBoundingClientRect();
+      if (nr.width <= 0 || nr.height <= 0) continue;
+      if (nr.bottom <= 0 || nr.top >= vh || nr.right <= 0 || nr.left >= vw) continue;  // 视口外
+      var nst = window.getComputedStyle(node);
+      if (nst.visibility === 'hidden' || nst.display === 'none') continue;
+      pieces.push({ top: nr.top, left: nr.left, text: own });
+      chars += own.length;
+      if (chars > textMax * 2) break;
     }
-    own = own.replace(/\s+/g, ' ').trim();
-    if (!own) continue;
-    var nr = node.getBoundingClientRect();
-    if (nr.width <= 0 || nr.height <= 0) continue;
-    if (nr.bottom <= 0 || nr.top >= vh || nr.right <= 0 || nr.left >= vw) continue;  // 视口外
-    var nst = window.getComputedStyle(node);
-    if (nst.visibility === 'hidden' || nst.display === 'none') continue;
-    pieces.push({ top: nr.top, left: nr.left, text: own });
-    chars += own.length;
-    if (chars > textMax * 2) break;
+    pieces.sort(function (a, b) {
+      return Math.abs(a.top - b.top) > 4 ? a.top - b.top : a.left - b.left;
+    });
+    viewportText = pieces.map(function (p) { return p.text; }).join(' ');
   }
-  pieces.sort(function (a, b) {
-    return Math.abs(a.top - b.top) > 4 ? a.top - b.top : a.left - b.left;
-  });
-  var viewportText = pieces.map(function (p) { return p.text; }).join(' ');
+
   return {
     ok: true,
     url: location.href,
     title: document.title,
     viewport: { w: window.innerWidth, h: window.innerHeight, scrollY: Math.round(window.scrollY) },
     total: total,
+    matched: matched.length,
     shown: items.length,
-    truncated: total > items.length,
+    truncated: matched.length > items.length,
     text: viewportText.slice(0, textMax) + (viewportText.length > textMax ? ' …' : ''),
     elements: items
   };
@@ -831,6 +1032,7 @@ function applescriptBackend(spec) {
     titleProp: spec.titleProp,
     currentTab: spec.currentTab,
     currentTabIndex: spec.currentTabIndex,
+    activeIndex: spec.activeIndex,
     bundlePaths: spec.bundlePaths,
     processName: spec.processName,
   }
@@ -906,6 +1108,8 @@ if (IS_WIN) {
       //  Chrome 152：`index of <tab>` 读不了（转 text/integer 都 -1700，
       // 赋值 -1728），只有 `active tab index` 可读。Safari 上两者都行。
       currentTabIndex: 'active tab index of w',
+      // 不依赖循环变量 t 的「当前页序号」表达式，给列标签页那种场合用。
+      activeIndex: 'active tab index of w',
       bundlePaths: ['/Applications/Google Chrome.app'],
       processName: 'Google Chrome',
     }),
@@ -919,6 +1123,7 @@ if (IS_WIN) {
       titleProp: 'name',
       currentTab: 'current tab',
       currentTabIndex: 'index of t',
+      activeIndex: 'index of current tab of w',
       // Safari 在较新 macOS 上可能只以 Cryptex 形式存在，两个路径都探。
       bundlePaths: [
         '/Applications/Safari.app',
@@ -947,15 +1152,15 @@ function asListTabs(be) {
     '    repeat with w in windows',
     '      set wi to wi + 1',
     '      set ti to 0',
+    // 当前页的判据：拿**循环计数器**和别人比，不要 `index of t` ——
+    // Chrome 152 上 `index of <tab>` 读不出来（-1700，见上面几处同样的坑），
+    // 而这里的 try 会把异常吞掉，结果就是「Chrome 上永远没有 ▶」，
+    // 谁也看不出当前停在哪个标签页。ti 本来就是 1-based 序号，比它更可靠。
+    `      set curIdx to (${be.activeIndex}) as integer`,
     '      repeat with t in tabs of w',
     '        set ti to ti + 1',
     '        set act to "false"',
-    '        try',
-    // 必须比 index，不能比引用：在 `repeat with t in tabs of w` 里 t 是对象的
-    // 引用，`t is current tab of w` 恒为 false ——  Safari 上所有标签都被
-    // 标成非当前。index 比较稳定。
-    `          if (index of t) is (index of ${be.currentTab} of w) then set act to "true"`,
-    '        end try',
+    '        if ti is curIdx then set act to "true"',
     '        set tname to ""',
     '        try',
     `          set tname to ${be.titleProp} of t`,
@@ -1224,7 +1429,33 @@ function asAddressFieldRect(be) {
   ].join('\n')
 }
 
-/** 浏览器窗口的屏幕矩形（供截图裁剪）。返回 `x␟y␟w␟h` 或 `ERR␟原因`。 */
+/**
+ * 浏览器窗口的屏幕矩形。返回 `x␟y␟w␟h` 或 `ERR␟原因`。
+ *
+ * 优先问浏览器**自己**（`bounds of front window`），不去问 System Events。
+ *
+ * 为什么：System Events 看到的是**辅助功能树里的窗口列表**，Chrome 会把弹层、
+ * 工具窗、扩展气泡也塞进去，而且顺序跟「用户眼里的主窗口」不一定一致。
+ * 实测踩到：Chrome 有 2 个 AX 窗口，`window 1` 取到的是个 362x180 的小窗 ——
+ * 于是真实鼠标点击的屏幕坐标、截图裁剪区域**全部按这个小窗算**，点哪儿都偏，
+ * 却依然报「已点击」。而 `bounds of front window` 给的是 (0,29,1280,775)，
+ * 一眼就对。Safari 同样支持 bounds，且两条都不依赖辅助功能。
+ */
+function asWindowRectNative(be) {
+  return [
+    'on run',
+    '  set fs to character id 31',
+    `  tell application "${be.app}"`,
+    '    if (count of windows) is 0 then return "ERR" & fs & "no window"',
+    '    set b to bounds of window 1',
+    '    return ((item 1 of b) as text) & fs & ((item 2 of b) as text) & fs & ' +
+      '(((item 3 of b) - (item 1 of b)) as text) & fs & (((item 4 of b) - (item 2 of b)) as text)',
+    '  end tell',
+    'end run',
+  ].join('\n')
+}
+
+/** 退路：浏览器不认 `bounds` 时，退回 System Events 的 AX 窗口。 */
 function asWindowRect(be) {
   return [
     'on run',
@@ -1450,11 +1681,16 @@ function asCloseTab(be) {
     '    end if',
     '    if ti is 0 then',
     `      set t to ${be.currentTab} of w`,
+    // Chrome 152 上 `index of <tab>` 读不出来（转 text / integer 都报 -1700）—— 和
+    // open 里 `index of newTab` 是同一个坑：拿得到 tab 引用，读不出它的 index。
+    // 关「当前页」时用后端自己的 currentTabIndex（Chrome 是 active tab index）；
+    // 关「指定页」时序号本来就是调用方给的 ti，不需要回读。
+    `      set tiOut to (${be.currentTabIndex}) as text`,
     '    else',
     '      set t to tab ti of w',
+    '      set tiOut to (ti as text)',
     '    end if',
     '    set wiOut to (index of w) as text',
-    '    set tiOut to (index of t) as text',
     '    set n to ""',
     '    try',
     `      set n to ${be.titleProp} of t`,
@@ -1529,9 +1765,12 @@ function asCloseByUrl(be) {
 
 function hintFor(raw) {
   const s = String(raw ?? '')
-  // 辅助功能必须排在最前：-1719 的中文文案里也含「辅助访问」，会被下面的
-  // 自动化分支抢走，给出错误指引（那是另一个权限、另一个设置面板）。
-  if (/-1719|-25211|不允许辅助访问|not allowed assistive access/i.test(s)) {
+  // 辅助功能必须排在最前，但**不能只看 -1719**：这个码一码两用 ——
+  //   · System Events 拒绝辅助功能时用它（文案含「辅助访问」）
+  //   · Chrome 报「无效的索引」也用它（实测：关标签页拿到 `tab 4 … 无效的索引 (-1719)`）
+  // 以前只要看到 -1719 就指去辅助功能面板，于是「序号过期」被解释成「没权限」，
+  // 用户照着点了一圈设置也没用。所以这一支必须同时出现「辅助访问」字样。
+  if (/-25211|不允许辅助访问|not allowed assistive access/i.test(s)) {
     return '这是「辅助功能」权限，只有真实鼠标/键盘（real:true）需要：打开「系统设置 → 隐私与安全性 → 辅助功能」，把「DSH Desktop」打开；若列表里没有它、或报错点名 osascript，就点左下角「+」，按 Cmd+Shift+G 输入 /usr/bin，选中 osascript 添加。页内合成模式（real 省略）不需要这个权限。'
   }
   if (/Apple Events|not allowed to execute JavaScript|not authorized to send Apple events to/i.test(s) && /JavaScript/i.test(s)) {
@@ -1543,7 +1782,7 @@ function hintFor(raw) {
   if (/-600|not running|isn't running/i.test(s)) {
     return '浏览器没有运行：先调用 mac_browser_open（不带 url）或 mac_browser_activate 把它启动起来。'
   }
-  if (/-1728|Invalid index|Can't get tab|Can’t get tab/i.test(s)) {
+  if (/-1719|-1728|Invalid index|无效的索引|Can't get tab|Can’t get tab/i.test(s)) {
     return '窗口 / 标签页序号无效：先调用 mac_browser_tabs 取最新列表再操作。'
   }
   return ''
@@ -1601,16 +1840,122 @@ export function asHostFocus(appName) {
   ].join('\n')
 }
 
+/**
+ * 单次调用该走页内合成还是真实鼠标键盘。
+ *
+ * 顺序刻意是「参数 > 全局开关」：全局开关只是省掉每次手写 `real: true`，
+ * 但显式参数永远能反驳它 —— 开了 mode:'real' 还要能单次 real:false 跑快的，
+ * 关着开关也要能单次 real:true 让光标走一趟。
+ *
+ * 只把**布尔**当真：schema 约束了类型，这里再守一道，别让字符串 "false" 反而变真。
+ * mode 只认 'real'，其余（含写错的拼写）一律当 synthetic —— 配错的代价是「没变慢」，
+ * 而不是「所有操作突然要求前台标签页」。
+ */
+export function wantsRealInput(args, mode) {
+  if (args?.real === true) return true
+  if (args?.real === false) return false
+  return mode === 'real'
+}
+
+/**
+ * 随插件走的一篇 skill：把「固定站点怎么操作」的静态知识单独放，不塞进工具描述。
+ *
+ * 为什么分开：工具描述每轮都进上下文，而 skill 只在模型真要用时才加载。
+ * 对「同一个后台反复操作」这种场景，它省掉的是**探索**（快照 → 找元素），
+ * 不是定位（点之前仍要知道元素在）。
+ */
+const PLAYBOOK = `# 浏览器操作手册（mac-browser）
+
+这份手册给「已经知道要去哪、点什么」的场景用：能照着直接做，就不要先快照再摸索。
+
+## 一、先选模式
+
+| 场景 | 用哪个 |
+| --- | --- |
+| 普通后台、表单、要快 | 默认 \`synthetic\`（页内合成，约 50ms） |
+| 站点只认真实事件（B 站等风控站）、或要给人看光标 | \`real: true\`（约 0.4–1.7s） |
+| 一次合成点击后页面没反应 | **先换 \`real: true\` 再试**，别反复合成点 |
+| 目标标签页在后台 | 只能合成；真实模式会被拒绝 |
+
+判断信号：合成点击后 URL 没变、DOM 没变、也没报错 → 大概率被站点忽略，切真实。
+
+## 二、定位优先级（从快到慢）
+
+1. **已知选择器**（下面站点卡里写的）→ \`click({selector})\`
+2. **表单字段用 label** → \`type({label:"客户编码", value:"..."})\`
+3. **定向快照** → \`snapshot({filter:"关键字"})\`，一次约 100 字符
+4. **整页快照** → 最后手段，约 2–3k 字符
+5. **截图** → 只有 DOM 全找不到时才用
+
+## 三、纪律
+
+- 提交前先 \`formcheck\`；查到必填为空就**列给用户问**，不要自己挑值
+- \`selector\` 命中多个 → 工具会拒绝并列出候选；改用 label 或收窄选择器，别随手填 index
+- 找不到元素就停，不要猜一个相近的继续
+- 关键动作后回读一次（URL / 关键文本），确认真的生效
+
+## 四、站点卡
+
+### E6 Meta Engine（http://124.223.203.144:9006）
+
+- 左侧菜单 \`.el-menu-item\`，顺序：0 配置中心 / 1 元数据模板 / 2 业务数据 / 3 字典管理 / 4 查询台 / 5 AI 助手 / 6 变更与事件 / 7 接口开放 / 8 运维 / 9 数据权限
+- 登录：账号 \`input[type=text]\`，密码 \`input[type=password]\`，按钮文字「登 录」（中间有空格）
+- 表单字段优先用 label；但**字典管理的新建弹窗没有 label 关联**，要按 placeholder 定位：
+  字典编码 \`input[placeholder="例如 unit"]\`，名称 \`input[placeholder="例如 计量单位"]\`，
+  说明/备注是 textarea（选填）
+- 点「新建字典」要 \`{ text: '新建字典', exact: true }\` —— 不加 exact 会同时命中禁用的「新建字典项」按钮
+- Element Plus 下拉的容器是 \`.el-select__wrapper\`
+- 表格行按钮：\`.el-table__body .el-table__row:first-child .el-button\`，index 0 归档 / 1 列表 / 2 主子表
+- 表格里的名称列是**纯文本**，不在元素表里，\`filter\` 找不到它
+
+### 哔哩哔哩
+
+- 搜索框 \`.nav-search-input\`，搜索按钮 \`.nav-search-btn\`
+- ⚠️ 只认真实事件：搜索按钮、搜索结果卡片用合成点击会被静默忽略 → 必须 \`real:true\`
+- 番剧页右侧选集是**虚拟列表**（一次只渲染约 20 个），\`filter\` 找不到未渲染的集数。
+  用配方 \`bilibili-episode\`（内部是 \`scrollUntil\` + 真实点击）：一条调用直接滚到指定集并打开
+- 搜索结果里同一个视频有两个链接（缩略图 + 标题），selector 会命中 2 个 → 用 index 1 点标题
+
+## 六、怎么维护这份手册（重要）
+
+手册不是一次写完的，是**每次探索的沉淀**：
+
+1. **第一次**遇到某个固定页面：照常探索（\`snapshot({filter})\`），把确认过的选择器记下来
+2. **写回来**：把「选择器 + 注意事项 + 失败形态」追加到上面站点卡，重载插件即生效
+3. **之后**：同一页面再来，直接照卡操作，**零快照**
+4. **要跑很多次的流程**：升级成配方（\`recipes\`），一次调用跑完，连回合都省了
+
+判断标准很简单：**同一个页面第二次来，就不该再探索。** 如果发现自己在重复快照，
+说明有东西该写进这里了。
+
+## 五、失败长什么样
+
+- 合成点击「成功」但页面没变 → 站点拦了，换 \`real:true\`
+- \`filter\` 返回 0 → 先 \`read\` 确认这段文字在不在当前页；可能在别的标签页、折叠区，或还没渲染
+- \`-1719 无效的索引\` → 标签页序号过期，重新 \`tabs\` 取序号
+- \`工具超时\` → 多半是真实鼠标动画 + 页面慢，调小 \`pointer.steps/stepMs\` 或换合成
+`
+
 export function apply(ctx, config) {
   const cfg = config ?? {}
 
-  // 鼠标移动手感。三者都做了夹紧，配错值不会把光标卡死或拖到几秒。
+  // 鼠标移动手感。数值项都做了夹紧，配错值不会把光标卡死或拖到几秒。
   const rawPointer = cfg.pointer && typeof cfg.pointer === 'object' ? cfg.pointer : {}
+  // 输入总开关：synthetic（缺省，页内合成点击 —— 快、不依赖前台、不要权限）/
+  // real（真实鼠标键盘 —— 光标会真的走过去，但每次约 1.5s，且目标标签页必须在前台）。
+  // 只认这两个值，写错了一律当 synthetic：配错的代价是"没变慢"，不是"突然点不动"。
+  const pointerMode = rawPointer.mode === 'real' ? 'real' : 'synthetic'
   const pointer = {
     steps: Math.min(400, Math.max(2, Number.isInteger(rawPointer.steps) ? rawPointer.steps : 48)),
     stepMs: Math.min(200, Math.max(1, Number.isInteger(rawPointer.stepMs) ? rawPointer.stepMs : 20)),
     easing: rawPointer.easing === 'linear' ? 'linear' : 'easeInOut',
+    mode: pointerMode,
   }
+
+  // 单次调用到底走哪条路：**调用参数优先，其次全局开关**。
+  // 显式 real:false 必须能压过 mode:'real' —— 开了总开关，也还得能单独跑一次快的。
+  // 反过来 real:true 永远有效，不受开关关着的影响。
+  const useReal = (args) => wantsRealInput(args, pointerMode)
 
   // ── 随插件走的「多指令 / 模糊指令」约定（系统提示词段）────────────────────
   // 插件是全局装的，所以这段注册在宿主作用域 → 进程内每个 agent 都会看到。
@@ -1635,6 +1980,30 @@ export function apply(ctx, config) {
         })
       })
     }
+  }
+
+  // ── 随插件走的「操作手册」skill ─────────────────────────────────────────
+  // 静态知识（选择器、模式选择、失败形态）放这里，而不是全塞进工具描述：
+  // 工具描述每一轮都进上下文，skill 只在模型真要动手时才加载。
+  // skills 是**可选**依赖：没装 dsh-skill 的 profile 里插件照常跑，只是没有这篇。
+  const skillsService = ctx.get('skills')
+  if (skillsService !== undefined) {
+    ctx.effect(
+      () =>
+        skillsService.register({
+          name: 'mac-browser-playbook',
+          description: '浏览器操作手册：合成/真实模式怎么选、已知站点的选择器、失败怎么读',
+          whenToUse: '在固定站点反复操作（尤其表单）、或点击后页面没反应时先读这篇，能省掉整页快照',
+          content: PLAYBOOK,
+          // source 必须显式给：注册表只补 invocation 与 provider 的默认值，
+          // 漏掉它加载时会报 `source must be a string`（实测）。
+          source: 'runtime',
+          invocation: { modelInvocable: true, userInvocable: true },
+        }),
+      'mac-browser: playbook skill',
+    )
+  } else {
+    ctx.logger?.warn?.('mac-browser: skills 服务不可用，跳过操作手册 skill')
   }
 
   const timeoutMs =
@@ -2048,6 +2417,37 @@ export function apply(ctx, config) {
       )
     }
 
+    // scrollUntil：在指定容器里「滚一段 → 找一次」，直到目标文字出现。
+    // 虚拟列表（番剧选集、长商品列表）只能这么处理：没渲染的元素不在 DOM 里，
+    // filter / snapshot 都看不见，必须靠滚动把它造出来。
+    if (step.scrollUntil !== undefined) {
+      const spec = typeof step.scrollUntil === 'string' ? { text: step.scrollUntil } : step.scrollUntil
+      const needle = String(spec.text ?? '').trim()
+      if (needle === '') throw new Error('scrollUntil 需要 text（要滚到哪个文字）')
+      const container = typeof spec.container === 'string' ? spec.container : ''
+      const maxSteps = Math.max(1, Math.min(80, Number(spec.max) || 40))
+      const px = Math.max(50, Math.min(3000, Number(spec.step) || 400))
+      const be = pickBackend(base.browser)
+      for (let i = 0; i < maxSteps; i++) {
+        const { result } = await runInPage(be, '__mbScrollFind', { container, text: needle, step: px }, base.window, base.tab, exec)
+        if (result.ok !== true) throw new Error(`滚动查找失败（${JSON.stringify(result)}）`)
+        if (result.found) {
+          // 虚拟列表在滚动后还会重渲染一轮：立刻返回的话，下一句 click 可能刚好
+          // 撞在「旧行已卸载、新行还没挂上」的空档里（实测过一次）。留一点稳定时间。
+          await sleep(250)
+          return `滚到「${needle}」（第 ${String(i + 1)} 次，容器 ${String(result.scrollTop)}px / ${String(result.max)}px）`
+        }
+        if (result.atEnd) {
+          throw new Error(
+            `滚到底也没找到「${needle}」（滚了 ${String(i + 1)} 次，共 ${String(result.max)}px）。` +
+              '可能是文字对不上、或者它不在这个容器里 —— 先 mac_browser_read 确认，不要猜一个相近的继续。',
+          )
+        }
+        await sleep(120)
+      }
+      throw new Error(`滚了 ${String(maxSteps)} 次还没找到「${needle}」，已停下。`)
+    }
+
     if (step.click !== undefined) {
       const spec = typeof step.click === 'string' ? { selector: step.click } : step.click
       const r = await invokeTool('mac_browser_click', {
@@ -2098,7 +2498,32 @@ export function apply(ctx, config) {
     description: `目标浏览器：${[...backends.keys()].join(' / ')}（缺省 ${defaultBackendId}）。`,
   }
 
-  const register = (definition) => ctx.tools.register(definition)
+  // 工具级时限：config.toolTimeouts 按工具名覆盖（慢站点 / 长配方用得到）。
+  // 非正数、非数字一律忽略 —— 宁可退回内置值，也不要让拼错的配置把工具变成
+  // 「注册即触发超时」。
+  const toolTimeoutOverrides =
+    cfg.toolTimeouts && typeof cfg.toolTimeouts === 'object' ? cfg.toolTimeouts : {}
+  const toolTimeout = (name) => {
+    const override = toolTimeoutOverrides[name]
+    if (Number.isFinite(override) && override > 0) return override
+    return TOOL_TIMEOUT_MS[name] ?? DEFAULT_TIMEOUT_MS
+  }
+
+  /**
+   * 统一补上当前 ToolDefinition 契约里两个可选字段：
+   *   · timeoutMs        —— 整个调用的协作式上限，交给 dsh-tool-call-timeout-policy
+   *   · isConcurrencySafe —— 缺省按 exclusive 处理；这里只给纯读工具放行并行
+   *
+   * 放在这里而不是逐个工具写：十五个工具里十个是同一套语义（独占 + 各自时限），
+   * 散着写既容易漏，也看不出「谁允许并行」这个整体判断。单个工具想特事特办，
+   * 在它自己的定义里写同名键即可（后面的展开会覆盖）。
+   */
+  const register = (definition) =>
+    ctx.tools.register({
+      timeoutMs: toolTimeout(definition.name),
+      isConcurrencySafe: () => PARALLEL_SAFE_TOOLS.has(definition.name),
+      ...definition,
+    })
 
   /* ── 截图（macOS：screencapture）─────────────────────────────────────── */
 
@@ -2219,7 +2644,8 @@ export function apply(ctx, config) {
         `mac-browser：目标标签页不在前台，不能用${what}操作它。\n` +
           '真实鼠标/键盘/滚轮事件按屏幕坐标发出，只会落到当前可见的那一页 —— ' +
           '硬做的话事件会打到别的页面上，却报告成功。\n' +
-          '先用 mac_browser_activate 把这一页切到前台，再重试。',
+          '先用 mac_browser_activate 把这一页切到前台，再重试；' +
+          '或者传 real:false 改走页内合成模式（不需要前台，但没有可见光标）。',
       )
     }
   }
@@ -2238,11 +2664,30 @@ export function apply(ctx, config) {
    *
    * 缩放 100% 时 kx=ky=1，退化成原来的加法 —— 与既有基准一致。
    */
-  const toScreen = async (be, vpGeo, vp, exec) => {
+  /**
+   * 取浏览器窗口矩形：**先问浏览器自己**（bounds），失败再退回 System Events。
+   * 退路存在是因为极少数版本/配置下 `bounds` 不可用；但默认路径必须是前者 ——
+   * System Events 的 AX `window 1` 可能是个弹层小窗，会把这套坐标换算整体带偏。
+   */
+  const readWindowRect = async (be, exec) => {
+    try {
+      const out = await runOsa(asWindowRectNative(be), [], exec)
+      const p = out.split(FIELD_SEP)
+      if (p[0] !== 'ERR') {
+        const r = { x: Number(p[0]), y: Number(p[1]), w: Number(p[2]), h: Number(p[3]) }
+        if (Number.isFinite(r.x) && Number.isFinite(r.y) && r.w > 0 && r.h > 0) return r
+      }
+    } catch (nativeErr) {
+      /* 退回 System Events */
+    }
     const out = await runOsa(asWindowRect(be), [], exec)
-    const p = out.split(FIELD_SEP)
-    if (p[0] === 'ERR') throw new Error(`mac-browser：取窗口矩形失败 —— ${p[1] || '未知原因'}`)
-    const win = { x: Number(p[0]), y: Number(p[1]), w: Number(p[2]), h: Number(p[3]) }
+    const q = out.split(FIELD_SEP)
+    if (q[0] === 'ERR') throw new Error(`mac-browser：取窗口矩形失败 —— ${q[1] || '未知原因'}`)
+    return { x: Number(q[0]), y: Number(q[1]), w: Number(q[2]), h: Number(q[3]) }
+  }
+
+  const toScreen = async (be, vpGeo, vp, exec) => {
+    const win = await readWindowRect(be, exec)
     const kx = vpGeo && vpGeo.outerW > 0 && win.w > 0 ? win.w / vpGeo.outerW : 1
     const ky = vpGeo && vpGeo.outerH > 0 && win.h > 0 ? win.h / vpGeo.outerH : 1
     const chromeH = vpGeo ? Number(vpGeo.chromeH) || 0 : 0
@@ -2312,6 +2757,13 @@ export function apply(ctx, config) {
         }
       }
       lines.push(`辅助功能权限：${ax}`)
+      lines.push(
+        `输入模式（config.pointer.mode）：${
+          pointerMode === 'real'
+            ? 'real —— 默认真实鼠标键盘：光标会真的走过去（约 1.5s/次），且目标标签页必须在前台'
+            : 'synthetic —— 默认页内合成：快、不依赖前台、不要辅助功能；单次传 real:true 即改走真实鼠标'
+        }`,
+      )
       lines.push(`已启用后端：${[...backends.keys()].join(', ')}；缺省：${defaultBackendId}`)
       const hp = hostApp()
       lines.push(`宿主应用（mac_browser_host_focus 的目标）：${hp.name}  ←  ${hp.appPath}`)
@@ -2332,7 +2784,7 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         url: { type: 'string', description: '要打开的 URL，如 https://example.com；省略则只唤起前台。' },
-        real: { type: 'boolean', description: '像人一样操作：把鼠标移到地址栏、点一下、输入 URL、回车。需要「辅助功能」权限，且光标会可见地移动。默认否（用 AppleScript 直接建标签页，更快但不产生任何可见动作）。' },
+        real: { type: 'boolean', description: '像人一样操作：把鼠标移到地址栏、点一下、输入 URL、回车。需要「辅助功能」权限，且光标会可见地移动。默认否（用 AppleScript 直接建标签页，更快但不产生任何可见动作）；配了 config.pointer.mode: real 时默认为是，可显式传 false 单次关掉。' },
         browser: browserParam,
       },
       required: [],
@@ -2364,7 +2816,7 @@ export function apply(ctx, config) {
 
       // real:true —— 像人一样：移动鼠标点地址栏 → 输入 URL → 回车。
       // 地址栏属于浏览器 chrome，页面 JS 拿不到，只能走无障碍树的 AXTextField。
-      if (args?.real === true && url !== '') {
+      if (useReal(args) && url !== '') {
         requireCap(be, 'realInput', '真实鼠标键盘')
         const rect = await runOsa(asAddressFieldRect(be), [], exec)
         const p = rect.split(FIELD_SEP)
@@ -2497,7 +2949,13 @@ export function apply(ctx, config) {
       const wi = Number.isInteger(args?.window) && args.window > 0 ? args.window : 0
       const ti = Number.isInteger(args?.tab) && args.tab > 0 ? args.tab : 0
       requireCap(be, 'eval', '执行 JS')
-      const stdout = await runOsa(asTabScript(be, 'eval'), [String(wi), String(ti), expression], exec)
+      // 包一层 try/catch。页面里的表达式抛错时，AppleScript 那边只会把结果变成
+      // 字符串 "missing value" —— 模型看到的就是这么一句毫无信息的话，既不知道
+      // 是语法错、变量不存在，还是页面根本没加载。包起来至少能把 message 带回来。
+      // 顺带修掉一个老毛病：`{a:1}` 这种以 `{` 开头的表达式原来是语句块（返回 undefined），
+      // 现在在括号里就按对象字面量求值。
+      const wrapped = `(function () { try { return (${expression}) } catch (e) { return '⛔️ JS 报错：' + String((e && e.message) || e) } })()`
+      const stdout = await runOsa(asTabScript(be, 'eval'), [String(wi), String(ti), wrapped], exec)
       const p = stdout.split(FIELD_SEP)
       if (p[0] === 'ERR') throw new Error(`mac-browser：${p[1] || '没有窗口'}`)
       return { text: `${p[3] || ''}\n→ ${p[4] || '(空结果)'}` }
@@ -2600,7 +3058,7 @@ export function apply(ctx, config) {
   register({
     name: 'mac_browser_click',
     description:
-      '在真实浏览器里点击页面元素 —— 模拟鼠标点击的主力。定位二选一：selector（CSS 选择器）或 text（可见文字，如「关闭」「搜索」「登录」）。按 text 定位时优先可交互元素、并在其中取面积最小的，避免点到包住整页的容器。匹配到多个用 index 选第几个（从 0 起）。默认走页内合成点击（不需额外权限）；个别元素刻意校验 isTrusted、或站点自身状态让合成事件失效时，用 real:true 改走 System Events 发真实鼠标事件（需要「辅助功能」权限）。点击后页面可能跳转，需要重新观察时用 mac_browser_read / mac_browser_tabs。',
+      '在真实浏览器里点击页面元素 —— 模拟鼠标点击的主力。定位二选一：selector（CSS 选择器）或 text（可见文字，如「关闭」「搜索」「登录」）。按 text 定位时优先可交互元素、并在其中取面积最小的，避免点到包住整页的容器。匹配到多个用 index 选第几个（从 0 起）。默认走页内合成点击（不需额外权限）；配置了 pointer.mode: real 或单次传 real:true 时改走 CoreGraphics 真实鼠标 —— 光标会可见地走过去（需要「辅助功能」权限，且目标标签页必须在前台）。点击后页面可能跳转，需要重新观察时用 mac_browser_read / mac_browser_tabs。',
     parameters: {
       type: 'object',
       properties: {
@@ -2611,7 +3069,7 @@ export function apply(ctx, config) {
         index: { type: 'integer', description: '匹配到多个时点第几个，从 0 起；默认 0。' },
         ref: { type: 'integer', description: '元素编号，来自 mac_browser_snapshot 的输出。**优先用它** —— 不用猜选择器，也不受「同名元素有多个」影响。与 selector / text 三选一。' },
         label: { type: 'string', description: '**按表单标签文字定位控件**，如「客户编码」「数量」。表单会重渲染、字段会增删，selector 的 nth-child 路径和缓存的 ref 都会整体错位；标签是语义，不受影响。与 selector / text / ref 四选一。' },
-        real: { type: 'boolean', description: '用真实鼠标事件（CoreGraphics，光标会可见地移过去）代替页内合成点击；需要「辅助功能」权限，且会先把浏览器窗口切到前台。**目标标签页必须在最前面** —— 真实点击按屏幕坐标发出，会点到别的页面上，所以后台标签页会被直接拒绝。默认否。' },
+        real: { type: 'boolean', description: '用真实鼠标事件（CoreGraphics，光标会可见地移过去）代替页内合成点击；需要「辅助功能」权限，且会先把浏览器窗口切到前台。**目标标签页必须在最前面** —— 真实点击按屏幕坐标发出，会点到别的页面上，所以后台标签页会被直接拒绝。默认否；配了 config.pointer.mode: real 时默认为是，可显式传 false 单次关掉。' },
         x: { type: 'integer', description: '屏幕横坐标。给了 x/y 就直接在坐标上真实点击（**视觉兜底**用：DOM 找不到元素时先 mac_browser_screenshot 看图再给坐标）。Windows 上则是唯一可用的点击方式。' },
         y: { type: 'integer', description: '屏幕纵坐标。与 x 配对使用。' },
         window: { type: 'integer', description: '窗口序号；省略或 0 = 前台窗口。' },
@@ -2678,8 +3136,8 @@ export function apply(ctx, config) {
       // 会把明确的选择也拦下来。（原来写成 > 0 才透传，index:0 会被当成没给。）
       if (Number.isInteger(args?.index) && args.index >= 0) options.index = args.index
 
-      // real:true —— 页内只负责定位，真实指针事件交给 JXA + CoreGraphics
-      if (args?.real === true) {
+      // real:true（或全局 mode:'real'）—— 页内只负责定位，真实指针事件交给 JXA + CoreGraphics
+      if (useReal(args)) {
         const located = await runInPage(be, '__mbLocate', options, wi, ti, exec)
         if (located.result.ok !== true) throw new Error(inPageError(located.result, options))
         assertFrontTab(located.result, '真实鼠标点击')
@@ -2721,7 +3179,7 @@ export function apply(ctx, config) {
         label: { type: 'string', description: '**按表单标签文字定位输入框**，如「数量」「客户编码」「商品名称」。表单重渲染会移位索引与缓存 ref，标签不会。与 selector / text / ref 四选一。' },
         index: { type: 'integer', description: 'selector 命中多个时取第几个，从 0 起。**不给就拒绝执行**（避免默默输错框）；确实要第一个就写 0。' },
         submit: { type: 'boolean', description: '输入后是否提交（默认否）。' },
-        real: { type: 'boolean', description: '用真实键盘（System Events）代替页内赋值；需要「辅助功能」权限。会先真实点一下输入框确保焦点，再 Cmd+A 全选、用「写剪贴板 + Cmd+V」粘贴 —— 中文必须这么送，keystroke 直送中文会被拼音输入法吃成乱码。会短暂占用系统剪贴板（原本是文本则尽力还原）。**目标标签页必须在最前面**（真实点击按屏幕坐标发出），后台标签页会被直接拒绝。默认否。' },
+        real: { type: 'boolean', description: '用真实键盘（System Events）代替页内赋值；需要「辅助功能」权限。会先真实点一下输入框确保焦点，再 Cmd+A 全选、用「写剪贴板 + Cmd+V」粘贴 —— 中文必须这么送，keystroke 直送中文会被拼音输入法吃成乱码。会短暂占用系统剪贴板（原本是文本则尽力还原）。**目标标签页必须在最前面**（真实点击按屏幕坐标发出），后台标签页会被直接拒绝。默认否；配了 config.pointer.mode: real 时默认为是，可显式传 false 单次关掉。' },
         window: { type: 'integer', description: '窗口序号；省略或 0 = 前台窗口。' },
         tab: { type: 'integer', description: '标签页序号；省略或 0 = 当前标签页。' },
       },
@@ -2763,8 +3221,8 @@ export function apply(ctx, config) {
       if (Number.isInteger(args?.index) && args.index >= 0) options.index = args.index
       if (args?.submit === true) options.submit = true
 
-      // real:true —— 两步：先用真实鼠标「走」过去点中目标（可见），再走键盘
-      if (args?.real === true) {
+      // real:true（或全局 mode:'real'）—— 两步：先用真实鼠标「走」过去点中目标（可见），再走键盘
+      if (useReal(args)) {
         options.focus = true
         const located = await runInPage(be, '__mbLocate', options, wi, ti, exec)
         if (located.result.ok !== true) throw new Error(inPageError(located.result, options))
@@ -2832,6 +3290,12 @@ export function apply(ctx, config) {
       const ti = Number.isInteger(args?.tab) && args.tab > 0 ? args.tab : 0
       const selector = typeof args?.selector === 'string' ? args.selector.trim() : ''
 
+      // 截图截的是**屏幕那一块区域**，不是「那个窗口」。浏览器不在前台时，压在它上面的
+      // app 会被原样拍进来 —— 实测拍到了 DSH 自己的插件页，却报告「已截图（浏览器窗口）」，
+      // 属于最坏的那种错：看着成功，内容全是错的。所以先把它切到前台再取矩形。
+      await runOsa(asActivate(be), [], exec)
+      await sleep(150)
+
       let rect
       let what
       if (selector !== '') {
@@ -2848,10 +3312,7 @@ export function apply(ctx, config) {
         }
         what = `元素 ${selector}`
       } else {
-        const out = await runOsa(asWindowRect(be), [], exec)
-        const p = out.split(FIELD_SEP)
-        if (p[0] === 'ERR') throw new Error(`mac-browser：取窗口矩形失败 —— ${p[1] || '未知原因'}`)
-        rect = { x: Number(p[0]), y: Number(p[1]), w: Number(p[2]), h: Number(p[3]) }
+        rect = await readWindowRect(be, exec)
         what = '浏览器窗口'
       }
 
@@ -2881,7 +3342,21 @@ export function apply(ctx, config) {
       properties: {
         browser: browserParam,
         max: { type: 'integer', description: '最多返回多少个元素；默认 60，上限 200。' },
-        textMax: { type: 'integer', description: '可见文字最多多少字符；默认 1200，上限 8000。' },
+        textMax: {
+          type: 'integer',
+          description: '可见文字最多多少字符；默认 400（够看个大概），上限 8000，传 0 = 完全不要文字块。',
+        },
+        filter: {
+          type: 'string',
+          description:
+            '只返回**标签里含这个词**的元素（不分大小写），并从 1 重新编号。给了它就**不返回可见文字块** —— 「我只想点某个东西」时用这个，token 最小。例：filter: "登录" 通常只剩 1–2 条。',
+        },
+        only: {
+          type: 'string',
+          enum: ['all', 'interactive'],
+          description:
+            'all（默认）连 cursor:pointer 的 div/li 一起收 —— 真实后台的导航常常没有 role/tabindex，只认语义标签会整个漏掉。interactive 只收语义可交互元素，输出更小，但可能漏掉靠样式绑事件的容器。',
+        },
         window: { type: 'integer', description: '窗口序号；省略或 0 = 前台窗口。' },
         tab: { type: 'integer', description: '标签页序号；省略或 0 = 当前标签页。' },
       },
@@ -2901,7 +3376,11 @@ export function apply(ctx, config) {
       const ti = Number.isInteger(args?.tab) && args.tab > 0 ? args.tab : 0
       const options = {}
       if (Number.isInteger(args?.max) && args.max > 0) options.max = args.max
-      if (Number.isInteger(args?.textMax) && args.textMax > 0) options.textMax = args.textMax
+      // textMax 允许 0（= 不要文字块），所以这里不能用 > 0 过滤掉它
+      if (Number.isInteger(args?.textMax) && args.textMax >= 0) options.textMax = args.textMax
+      if (args?.only === 'interactive') options.only = 'interactive'
+      const filterText = typeof args?.filter === 'string' ? args.filter.trim() : ''
+      if (filterText !== '') options.filter = filterText
 
       const { result } = await runInPage(be, '__mbSnapshot', options, wi, ti, exec)
       if (result.ok !== true) throw new Error('mac-browser：页面快照失败。')
@@ -2914,14 +3393,28 @@ export function apply(ctx, config) {
         const kind = String(e.kind).padEnd(14, ' ')
         return `  ${ref}  ${kind} ${e.label || '(无标签)'}  ${String(e.w)}x${String(e.h)}${e.disabled ? '  [禁用]' : ''}`
       })
-      const foot = result.truncated
-        ? `\n（共 ${String(result.total)} 个，只显示前 ${String(result.shown)} 个 —— 要更多就调大 max）`
+      const foot =
+        filterText !== ''
+          ? result.matched === 0
+            ? ''
+            : `\n（标签含「${filterText}」的共 ${String(result.matched)} 个，显示 ${String(result.shown)} 个）`
+          : result.truncated
+            ? `\n（共 ${String(result.total)} 个，只显示前 ${String(result.shown)} 个 —— 要更多就调大 max）`
+            : ''
+      const denominator = filterText !== '' ? result.matched : result.total
+      const empty = result.elements.length === 0
+        ? filterText !== ''
+          ? `\n（元素表里没有标签含「${filterText}」的项 —— filter 只匹配**能点/能输的元素**，` +
+            `页面上的纯文本不在表里。常见原因：还没渲染 / 要滚动 / 目标在别的标签页或折叠区里。` +
+            `先 mac_browser_read 确认这段文字在不在当前这一页，再决定是滚动、切标签页，还是换 selector）`
+          : ''
         : ''
+      const textBlock = result.text ? `\n\n可见文字：\n${result.text}` : ''
 
       return {
         text:
-          `${head}\n\n可见元素 ${String(result.shown)}/${String(result.total)}：\n` +
-          `${rows.join('\n')}${foot}\n\n可见文字：\n${result.text}`,
+          `${head}\n\n可见元素 ${String(result.shown)}/${String(denominator)}：\n` +
+          `${rows.join('\n')}${empty}${foot}${textBlock}`,
       }
     },
   })
@@ -3185,7 +3678,7 @@ export function apply(ctx, config) {
       properties: {
         name: { type: 'string', description: '配方名。省略则只列出可用配方，不执行。' },
         vars: { type: 'object', description: '变量表，用来替换步骤里的 {{name}}。例如 { query: "关键词" }。' },
-        real: { type: 'boolean', description: '这条配方的默认输入方式：true = 真实鼠标键盘（慢但更稳）。步骤里可单独覆盖。默认否。' },
+        real: { type: 'boolean', description: '这条配方的默认输入方式：true = 真实鼠标键盘（慢但更稳，光标可见）。步骤里可单独覆盖。默认否；配了 config.pointer.mode: real 时缺省为 true。' },
         browser: browserParam,
         window: { type: 'integer', description: '窗口序号；省略或 0 = 前台窗口。' },
         tab: { type: 'integer', description: '标签页序号；省略或 0 = 当前标签页。' },
@@ -3250,7 +3743,7 @@ export function apply(ctx, config) {
       }
 
       const vars = args?.vars && typeof args.vars === 'object' ? { ...args.vars } : {}
-      const base = { browser: args?.browser, real: args?.real === true, window: wi, tab: ti }
+      const base = { browser: args?.browser, real: useReal(args), window: wi, tab: ti }
       const trace = []
 
       for (let i = 0; i < recipe.steps.length; i++) {

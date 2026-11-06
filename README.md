@@ -25,7 +25,7 @@ AppleScript 注入。15 个工具，可在真实站点上完成「打开 → 登
 | `mac_browser_click` | **点击元素**：按 `selector` / `text` / **`label`**（表单标签文字）定位，`index` 选第几个 |
 | `mac_browser_type` | **在输入框打字**：按 `selector`/`text`/**`label`** 定位；`submit:true` 提交 —— 找得到提交/搜索按钮就点它，否则派发合成回车 |
 | `mac_browser_screenshot` | 截图（整个浏览器窗口，或指定元素）返回 PNG 路径，供模型 `read_image` 查看。用于 DOM 定位失败时的**视觉兜底**。需要「屏幕录制」权限 |
-| `mac_browser_snapshot` | **紧凑页面结构**：可见文字摘要 + 带编号的元素表。编号可直接用于 click/type 的 `ref`。探索陌生页面优先用它 |
+| `mac_browser_snapshot` | **紧凑页面结构**：带编号的元素表（+ 最多 400 字可见文字）。支持 `filter` 只取匹配项、`only:'interactive'` 只取语义可交互元素。编号可直接用于 click/type 的 `ref` |
 | `mac_browser_scroll` | **真实滚轮滚动**（CGEvent）：按方向 + 像素滚，或给 `ref`/`selector`/`text` 滚到目标可见 |
 | `mac_browser_formcheck` | **提交表单前的前置检查**：扫出「必填但为空」的字段。查到就**停下问用户**，不要自己挑值填 |
 | `mac_browser_host_focus` | 把**宿主应用**（跑着 agent 的那个 app，如 DSH Desktop）切到前台、还原最小化、未运行则启动 |
@@ -90,6 +90,32 @@ mac_browser_type {ref: 9, value: '100'}  → 直接往里输
 - 表格里的图标按钮没有文字、也没有 `title`/`aria`，标签会补上**所在行的标识 + 同父同类序号**
   （如 `A001 › <图标 1/7>`）。这样一行里几个长得一样的按钮才能区分开。
 
+### 省 token：定向快照
+
+「先看一眼、再点一下」的成本几乎全在快照上 —— 一次整页快照约 1.2–2k tokens，而且上下文
+是**累积重发**的，快照越频繁越贵。三个开关，按需取用：
+
+```js
+// ① 我已经知道要点什么：只回匹配项，不带文字块（实测 3k 字符 → 120 字符）
+mac_browser_snapshot({ filter: '登录' })      →  1  button  登 录
+mac_browser_click({ ref: 1 })
+
+// ② 只想要可交互元素，不要整页文字
+mac_browser_snapshot({ only: 'interactive', textMax: 0 })
+
+// ③ 连 400 字摘要都不要
+mac_browser_snapshot({ textMax: 0 })
+```
+
+- 给了 `filter` 就**不再返回可见文字块**，并且元素表**从 1 重新编号**（过滤后编号，不会错位）。
+- `filter` 匹配的是**元素表里的标签**（能点/能输的东西），不是全页文字搜索。页面上不参与
+  点击的纯文本（表格里的名称列、说明文字）不会出现在表里 —— 那种目标直接用
+  `mac_browser_click({ text: '…' })`，它会进页面按文字找。
+- `only: 'interactive'` 会放弃 `cursor:pointer` 那层兜底 —— 真实后台的导航常常是没有
+  `role`/`tabindex` 的 div，靠 cursor 才认得出来。**默认 `all` 就是为这个**，只在确定
+  目标是语义控件时才收窄。
+- 同一个页面要连点好几下时，**快照一次、连着用 `ref`**，比每步快照划算得多。
+
 ## 滚动
 
 `mac_browser_scroll` 发的是**真实滚轮事件**（`CGEventCreateScrollWheelEvent2`），和用户滚
@@ -131,26 +157,41 @@ mac_browser_scroll { text: 目标区块 }                   # 按可见文字找
 
 ## 安装
 
-包名 `dsh-mac-browser`。profile 名以该机器实际启动的为准 —— **DSH Desktop 启动的是
-`web` profile**（证据：`~/Library/Application Support/DSH Desktop/health-snapshots/`
-里每份快照都写着 `"profileName":"web"` / `"provider":"desktop-profile"`），
-`profiles/desktop/` 是个没被使用的空壳。
+包名 `dsh-mac-browser`。**DSH Desktop 启动的是 `desktop` profile** —— 实测两处证据：
+`ps` 里它的启动参数就是 `--profile /Users/ming/.dsh/profiles/desktop`；`Config.listConfigs`
+报的 `packageDir` 也落在 `profiles/desktop/node_modules/dsh-mac-browser`。装到别的 profile
+里，界面上什么都不会变。
+
+> 早先这里写的是 `web` profile，依据是 `health-snapshots` 里的 `"profileName":"web"` ——
+> 那个字段对应的是 `dsh web` 的浏览器外壳，不是 Desktop 实际加载的 profile。已按实测改正。
 
 ```sh
-dsh plugin --profile web add /path/to/dsh-mac-browser
+dsh plugin --profile desktop add /path/to/dsh-mac-browser
 ```
 
 然后把 `"dsh-mac-browser"` 加进 profile 的 `dsh.profile.bundles`：
 
-`~/.dsh/profiles/web/package.json`
+`~/.dsh/profiles/desktop/package.json`
 
 ```json
 "dsh": { "profile": { "bundles": [ ..., "dsh-mac-browser" ] } }
 ```
 
 重启 DSH Desktop 生效。`link:` 安装时改文件即生效（但仍需重启进程才会重新加载）。
+0.4.0 起也可以在「插件」页把这一行**关掉再打开**来热重载，不用重启整个 app。
 
-> 更简的替代做法：不动 `bundles`，直接往 `~/.dsh/profiles/web/cordis.patch.yml`
+> **从 0.4.0 起插件有了一个运行时依赖**（`@deepseek-ai/schemastery`，用来声明 Config，
+> 界面上的配置页要靠它才拿得到表单）。`link:` 方式安装时，依赖不会被 profile 一起装，
+> 要在插件目录自己装一次：
+>
+> ```sh
+> cd ~/.dsh/local-plugins/dsh-mac-browser && pnpm install
+> ```
+>
+> 不装的话 `import z from '@deepseek-ai/schemastery'` 会失败，**整个插件加载不起来**，
+> 浏览器工具会一起消失。装完重启 DSH 再确认 `mac_browser_status` 还能跑。
+
+> 更简的替代做法：不动 `bundles`，直接往 `~/.dsh/profiles/desktop/cordis.patch.yml`
 > （你自己的 patch 层，最后应用、能覆盖 bundle 层）插一行
 > `- insert: [- id: mac-browser, name: 'dsh-mac-browser']`。
 
@@ -167,10 +208,12 @@ dsh plugin --profile web add /path/to/dsh-mac-browser
 | --- | --- | --- |
 | `backends` | 全部 | 启用哪些后端 |
 | `defaultBackend` | `safari` | 省略 `browser` 参数时的落点；不属于本平台时自动退回第一个可用后端 |
-| `timeoutMs` | `20000` | 单次 osascript 超时 |
+| `timeoutMs` | `20000` | **单次** osascript / PowerShell 往返超时 |
+| `toolTimeouts` | `{}` | 按工具名覆盖**整体**时限（毫秒），见「工具时限与并行」。例：`{ mac_browser_recipe: 300000 }` |
 | `maxOutputBytes` | `512000` | 单流输出上限 |
 | `cwd` | `$HOME` | 子进程工作目录 |
 | `hostApp` | 自动识别 | `mac_browser_host_focus` 的目标 app；缺省从本进程 `execPath` 推 |
+| `pointer.mode` | `synthetic` | 输入总开关：`synthetic` = 页内合成点击（快、不依赖前台，但**看不见光标**）；`real` = 真实鼠标键盘（光标会真的走过去，每步约 1.5s，且目标标签页必须在前台）。单次调用传 `real:true` / `real:false` 仍然优先于这个开关 |
 | `pointer.steps` | `48` | 鼠标移动插值步数（夹在 2–400） |
 | `pointer.stepMs` | `20` | 每步间隔毫秒（夹在 1–200）；48×20 ≈ 0.96s |
 | `pointer.easing` | `easeInOut` | `easeInOut` 或 `linear`。匀速直线看起来像「被拖过去」 |
@@ -180,6 +223,73 @@ dsh plugin --profile web add /path/to/dsh-mac-browser
 | `instructionProtocolOrder` | `15` | 该提示词段的位置；有限数即可（`0` 也是合法值） |
 
 调鼠标速度只动前两项。嫌「一闪而过」就调大步数或间隔；超过约 2s 会让连续操作很烦。
+
+### 「页面点了，但鼠标没动」是怎么回事
+
+这是默认行为，不是坏了。默认的 `pointer.mode: synthetic` 走**页内合成点击**：插件在页面里
+派发一个合成 click 事件，页面照样响应，但系统鼠标压根没参与，所以指针一动不动。好处是快
+（几十毫秒）、不需要目标标签页在前台、也不需要辅助功能权限。
+
+想要「光标真的走过去」，二选一：
+
+```yaml
+# 全局开：所有 click / type / open / 配方默认都走真实鼠标键盘
+pointer:
+  mode: real
+```
+
+或者只让某一次走真实鼠标：
+
+```js
+mac_browser_click({ selector: '#submit', real: true })
+```
+
+开了 `mode: real` 之后，仍可以单次 `real: false` 走回合成模式（比如后台标签页里跑批量操作）。
+真实模式的代价：每次约 1.5 秒（48 步 × 20ms + 激活窗口），目标标签页必须在前台，并且要
+「辅助功能」权限。跑 `mac_browser_status` 能看到当前是哪个模式。
+
+### 在界面上切换鼠标模式
+
+装好并重启后，侧栏 **插件 → 已安装 → dsh-mac-browser**，那一行会多一个「配置」入口，
+点开就能在「页内合成 / 真实鼠标」之间切。点一下即保存，不设保存按钮 —— 只有两个值。
+
+它写的就是 profile 里那一行的配置，和手改 `cordis.patch.yml` 完全等价（同一个
+`settings.mutate` 通道）。保存后这一行会重启一次，`pointer.mode` 正好需要重启才生效。
+
+实现上这不是 DSH 自动生成的表单 —— DSH 目前**不会**按 Config schema 生成页面（`settings`
+服务虽然带 `autoGenerate` 字段，但没有已发布的客户端去消费它）。所以插件自带了一个
+浏览器半侧 [client.js](client.js)，注册到 `plugins.row.config` 槽（key 是
+`dsh-mac-browser#mac-browser`）。这也是为什么 0.4.0 起多了一个 schemastery 依赖。
+
+### 工具时限与并行
+
+每个工具都声明了 `timeoutMs` —— **整个调用**的上限，DSH 内置的 `dsh-tool-call-timeout-policy`
+会读它并在到点时 abort `exec.signal`。我们内部把这个取消转成终止子进程，所以模型看到的是一条
+干净的 `TOOL_TIMEOUT` 错误，而不是一轮永远不结束的等待。
+
+它和 `config.timeoutMs` 是两层：那个管**一次子进程**，这个管**一次工具调用**（可能含好几次
+子进程 + 页内轮询 + 真实鼠标动画）。内置值：
+
+| 工具 | 时限 | 工具 | 时限 |
+| --- | --- | --- | --- |
+| `status` | 30s | `screenshot` | 30s |
+| `open` | 45s | `snapshot` | 30s |
+| `tabs` / `read` / `eval` / `activate` / `close` | 20s | `scroll` | 45s |
+| `click` / `type` | 45s | `formcheck` | 30s |
+| `host_focus` | 30s | `recipe` | 180s |
+
+单个站点慢就按工具名覆盖，不用改代码：
+
+```yaml
+toolTimeouts:
+  mac_browser_recipe: 300000
+```
+
+并行语义也写清楚了（`isConcurrencySafe`）：只有 `status` / `tabs` / `read` / `screenshot` /
+`formcheck` 这五个纯读工具允许和同批的其他调用同时跑；点名、打字、滚动、开关标签页一律
+独占——两个真实鼠标事件同时发，落点会互相踩，而且会「都报成功」。`snapshot` 也故意独占：
+它给元素打 `data-mb-ref` 编号，并发会互相重编号。
+
 
 ## 随插件走的「多指令 / 模糊指令」约定
 
@@ -204,6 +314,44 @@ dsh plugin --profile web add /path/to/dsh-mac-browser
 8. **`selector` 命中多个就改用 `label`**，不要靠 `index` 蒙。
 
 > 为什么写进提示词而不是只写在文档里：**文档不会被 agent 在每次决策时读到，提示词会。**
+
+## 随插件附带的 skill：`mac-browser-playbook`
+
+插件加载时用 `ctx.skills.register(...)` 注册一篇内存 skill（`source: runtime`）。它是一份
+**操作手册**：合成/真实怎么选、定位优先级、操作纪律、已知站点的选择器卡，以及失败长什么样。
+
+为什么放 skill 而不是塞进工具描述：**工具描述每一轮都进上下文**，skill 只在模型真要动手时
+才加载。实测（E6 后台同一个表单反复填）：
+
+| | 无 skill | 有 skill |
+| --- | --- | --- |
+| 单次调用数 | 8 | **5** |
+| 单次字符 | ~2k | **~430** |
+| 快照次数 | 3（含 1 次整页） | **0** |
+
+skill 本身约 1.9k 字符，**盈亏平衡在 1.2 次左右** —— 做一次不划算，做两次以上就赚。
+
+### 怎么往里加内容
+
+- **改插件自带的这篇**：编辑 `index.js` 里的 `PLAYBOOK` 常量，重载插件生效。
+- **临时补充、不想动代码**：往 DSH 的技能目录丢文件，热加载、优先级最高（同名会覆盖插件那篇）：
+
+  ```
+  ~/.dsh/skills/<name>/SKILL.md          用户级
+  <项目>/.dsh/skills/<name>/SKILL.md     项目级（优先级最高）
+  <项目>/.agents/skills/<name>/SKILL.md
+  ```
+
+- `skills` 是**可选依赖**：profile 里没装 `dsh-skill` 时插件照常工作，只是没有这篇。
+
+### 维护流程（这是这套东西真正的用法）
+
+1. **第一次**遇到固定页面：照常探索（`snapshot({filter})`），把确认过的选择器记下来
+2. **写回来**：追加到站点卡，重载插件即生效
+3. **之后**同一页面：照卡直接操作，**零快照**
+4. **要跑很多次的流程**：升级成配方（`recipes`），一次调用跑完
+
+判断标准：**同一个页面第二次来，就不该再探索。** 发现自己在重复快照，就说明有东西该写进这里了。
 
 ## 站点配方（config.recipes）
 
@@ -233,6 +381,7 @@ recipes:
 | `expect: <selector>` 或 `{selector, timeoutMs, min, what}` | **断言这里必须有结果**，否则立刻停下（见下） |
 | `click: <selector>` 或 `{selector｜text, index, real}` | 点击 |
 | `type: {selector｜text, value, submit, real}` | 输入 |
+| `scrollUntil: {text, container?, step?, max?}` | 在容器里「滚一段 → 找一次」，直到目标文字出现（治虚拟列表，见下） |
 | `eval: <js 表达式>` | 逃生口；结果可从 `{{__last}}` 串到下一步 |
 | `screenshot: true` 或 `{selector}` | 截图，路径写进 trace |
 
@@ -241,6 +390,23 @@ recipes:
 
 配方里的 `click` / `type` 步骤会显式传 `index: 0`：配方是刻意编写的，「命中多个时取第一个」
 就是它写下来的语义。
+
+### `scrollUntil`：虚拟列表只能这么处理
+
+番剧选集、长商品列表这类**虚拟列表**一次只渲染 ~20 项，没滚到的元素**在 DOM 里根本不存在** ——
+`filter` / `snapshot` 都看不见它，于是只能绕去站内搜索（实测踩过）。
+
+```yaml
+- scrollUntil: { container: '.EpisodeVirtualList_scroll__62SmN', text: '{{ep}}', max: 40 }
+- click: { text: '{{ep}}', real: true }
+```
+
+两个实现细节都是踩出来的：
+
+- **先查后滚**：目标可能本来就在视野里。无条件先滚会对着已经到位的列表一路越滚越过。
+- **找到后等 250ms** 再返回：虚拟列表滚动后会重渲染一轮，立刻点会撞上「旧行已卸载、
+  新行还没挂上」的空档（报「没找到匹配的元素」）。
+- 滚到底还没找到就**硬失败**，并说明滚了多远、滚了几次。
 
 ### `expect`：空结果必须硬失败
 
